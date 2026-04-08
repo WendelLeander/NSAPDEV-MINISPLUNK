@@ -1,0 +1,6 @@
+Feb 22 00:05:38 SYSSVR1 systemd[1]: Started OpenBSD Secure Shell server
+Feb 22 00:05:40 WEBSVR2 nginx[500]: error: Connection refused (111: Connection refused)
+Feb 22 00:05:41 DBSVR3 mysqld[999]: Warning: Disk usage above threshold
+Feb 22 00:05:42 SYSSVR1 kernel[0]: debug trace at memory address 0xABCD
+Feb 22 00:05:43 SYSSVR1 systemd INFO Explicit severity token here
+this line is intentionally malformed and should be skipped
