@@ -216,10 +216,14 @@ def query_count_keyword(keyword: str) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _recv_all(sock: socket.socket, expected_size: int) -> bytes:
-    """Reliably receive exactly `expected_size` bytes from the socket."""
+    """Reliably receive exactly `expected_size` bytes from the socket.
+    Returns partial data if the connection is closed before all bytes arrive."""
     data = b""
     while len(data) < expected_size:
-        chunk = sock.recv(min(BUFFER_SIZE, expected_size - len(data)))
+        try:
+            chunk = sock.recv(min(BUFFER_SIZE, expected_size - len(data)))
+        except (ConnectionResetError, ConnectionAbortedError, OSError):
+            break  # Remote end closed forcibly — return whatever arrived
         if not chunk:
             break
         data += chunk
@@ -243,13 +247,11 @@ def _recv_message(sock: socket.socket) -> str:
 
 
 def handle_client(client_sock: socket.socket, addr: tuple):
-    """
-    Worker thread entry point.
-    Each invocation handles exactly one client session:
-      receive → decode → dispatch → respond → close.
-    """
     thread_name = threading.current_thread().name
     print(f"  [{thread_name}] Connection from {addr[0]}:{addr[1]}")
+
+    # Detect silently-dead clients (no FIN/RST) so recv() doesn't block forever
+    client_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     try:
         raw = _recv_message(client_sock)
@@ -264,6 +266,7 @@ def handle_client(client_sock: socket.socket, addr: tuple):
         # ── UPLOAD (INGEST) ────────────────────────────────────────────────
         # REPLACEMENT — parses and indexes in batches as data streams in
         # ── UPLOAD (INGEST) ──────────────────────────────────────────────────────
+        # ── UPLOAD (INGEST) ────────────────────────────────────────────────
         if category == "UPLOAD":
             if len(parts) < 3:
                 _send(client_sock, "ERROR|Malformed UPLOAD request.")
@@ -279,11 +282,18 @@ def handle_client(client_sock: socket.socket, addr: tuple):
             total_count = 0
             skipped = 0
             batch = []
-            leftover = parts[2]
-            bytes_received = len(leftover.encode("utf-8"))
-            client_disconnected = False  # ← track abrupt disconnect
+            leftover = parts[2]  # _recv_message already consumed the frame;
+            bytes_received = len(leftover.encode("utf-8"))  # this may be partial
+            aborted = bytes_received < declared_size
 
-            # ── Receive loop — catch disconnect locally so batch stays in scope ──
+            if aborted:
+                print(f"  [{thread_name}] Client disconnected mid-transfer "
+                      f"({bytes_received}/{declared_size} bytes received). "
+                      f"Retaining partial ingest…")
+
+            # The streaming while loop below is a safety net for any bytes that
+            # arrived after _recv_message (shouldn't happen with current protocol,
+            # but kept for robustness).
             try:
                 while bytes_received < declared_size:
                     chunk = client_sock.recv(BUFFER_SIZE)
@@ -304,12 +314,12 @@ def handle_client(client_sock: socket.socket, addr: tuple):
                             total_count += _store.insert_logs(batch)
                             batch.clear()
 
-            except (ConnectionResetError, BrokenPipeError, OSError) as e:
-                print(f"  [{thread_name}] Client disconnected mid-transfer: {e}. "
+            except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+                print(f"  [{thread_name}] Connection lost during streaming: {e}. "
                       f"Retaining partial ingest…")
-                client_disconnected = True  # ← skip sending response later
+                aborted = True
 
-            # ── Always commit whatever arrived, even on abrupt disconnect ────────
+            # Always process and commit whatever arrived — complete or partial
             for line in leftover.splitlines():
                 entry = parse_line(line)
                 if entry:
@@ -320,13 +330,15 @@ def handle_client(client_sock: socket.socket, addr: tuple):
             if batch:
                 total_count += _store.insert_logs(batch)
 
-            print(f"  [{thread_name}] INGEST: {total_count} entries indexed, "
+            status = "partial" if aborted else "complete"
+            print(f"  [{thread_name}] INGEST ({status}): {total_count} entries indexed, "
                   f"{skipped} lines skipped.")
 
-            if not client_disconnected:
+            if not aborted:
                 _send(client_sock,
                       f"SUCCESS|Successfully parsed and indexed {total_count} entries. "
                       f"({skipped} lines were unparseable and skipped.)")
+            # If aborted, client is already gone — attempting _send would throw
 
         # ── QUERY ──────────────────────────────────────────────────────────
         elif category == "QUERY":
