@@ -23,7 +23,7 @@ import time
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 65432
+DEFAULT_PORT = 8080
 BUFFER_SIZE  = 4096
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,6 +263,7 @@ def handle_client(client_sock: socket.socket, addr: tuple):
 
         # ── UPLOAD (INGEST) ────────────────────────────────────────────────
         # REPLACEMENT — parses and indexes in batches as data streams in
+        # ── UPLOAD (INGEST) ──────────────────────────────────────────────────────
         if category == "UPLOAD":
             if len(parts) < 3:
                 _send(client_sock, "ERROR|Malformed UPLOAD request.")
@@ -274,37 +275,41 @@ def handle_client(client_sock: socket.socket, addr: tuple):
                 _send(client_sock, "ERROR|Invalid file size in UPLOAD header.")
                 return
 
-            BATCH_SIZE = 10000  # parse and index this many lines at a time
+            BATCH_SIZE = 10000
             total_count = 0
             skipped = 0
             batch = []
-            leftover = parts[2]  # whatever arrived in the first recv
-
-            # Stream remaining bytes and process in batches
+            leftover = parts[2]
             bytes_received = len(leftover.encode("utf-8"))
+            client_disconnected = False  # ← track abrupt disconnect
 
-            while bytes_received < declared_size:
-                chunk = client_sock.recv(BUFFER_SIZE)
-                if not chunk:
-                    break
-                bytes_received += len(chunk)
-                leftover += chunk.decode("utf-8", errors="replace")
+            # ── Receive loop — catch disconnect locally so batch stays in scope ──
+            try:
+                while bytes_received < declared_size:
+                    chunk = client_sock.recv(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    bytes_received += len(chunk)
+                    leftover += chunk.decode("utf-8", errors="replace")
 
-                # Process complete lines from the buffer
-                while "\n" in leftover:
-                    line, leftover = leftover.split("\n", 1)
-                    entry = parse_line(line)
-                    if entry:
-                        batch.append(entry)
-                    else:
-                        skipped += 1
+                    while "\n" in leftover:
+                        line, leftover = leftover.split("\n", 1)
+                        entry = parse_line(line)
+                        if entry:
+                            batch.append(entry)
+                        else:
+                            skipped += 1
 
-                    # Commit batch to store
-                    if len(batch) >= BATCH_SIZE:
-                        total_count += _store.insert_logs(batch)
-                        batch.clear()
+                        if len(batch) >= BATCH_SIZE:
+                            total_count += _store.insert_logs(batch)
+                            batch.clear()
 
-            # Process any remaining content after the stream ends
+            except (ConnectionResetError, BrokenPipeError, OSError) as e:
+                print(f"  [{thread_name}] Client disconnected mid-transfer: {e}. "
+                      f"Retaining partial ingest…")
+                client_disconnected = True  # ← skip sending response later
+
+            # ── Always commit whatever arrived, even on abrupt disconnect ────────
             for line in leftover.splitlines():
                 entry = parse_line(line)
                 if entry:
@@ -312,15 +317,16 @@ def handle_client(client_sock: socket.socket, addr: tuple):
                 else:
                     skipped += 1
 
-            # Commit final batch
             if batch:
                 total_count += _store.insert_logs(batch)
 
             print(f"  [{thread_name}] INGEST: {total_count} entries indexed, "
                   f"{skipped} lines skipped.")
-            _send(client_sock,
-                  f"SUCCESS|Successfully parsed and indexed {total_count} entries. "
-                  f"({skipped} lines were unparseable and skipped.)")
+
+            if not client_disconnected:
+                _send(client_sock,
+                      f"SUCCESS|Successfully parsed and indexed {total_count} entries. "
+                      f"({skipped} lines were unparseable and skipped.)")
 
         # ── QUERY ──────────────────────────────────────────────────────────
         elif category == "QUERY":
