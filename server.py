@@ -327,6 +327,10 @@ def handle_client(client_sock: socket.socket, addr: tuple):
                 else:
                     skipped += 1
 
+                if len(batch) >= BATCH_SIZE:
+                    total_count += _store.insert_logs(batch)
+                    batch.clear()
+
             if batch:
                 total_count += _store.insert_logs(batch)
 
